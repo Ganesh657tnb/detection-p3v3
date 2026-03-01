@@ -6,33 +6,58 @@ from Cryptodome.Util import Counter
 
 DB_NAME = "guardian.db"
 SECRET_KEY = b"SixteenByteKey!!"
+
 WM_SEGMENTS = [(10,3), (40,3), (70,3)]
-BIT_LEN = 128
+BIT_LEN_NONCE = 64
+BIT_LEN_DATA = 64
+TOTAL_BITS = BIT_LEN_NONCE + BIT_LEN_DATA
+FIXED_SEED = 9999
 
 # ================= PN =================
-def pn_sequence(n, nonce):
+def fixed_pn(n):
+    np.random.seed(FIXED_SEED)
+    return (np.random.randint(0,2,n)*2 - 1).astype(np.float32)
+
+def derived_pn(n, nonce):
     seed_material = hashlib.sha256(SECRET_KEY + nonce).digest()
     seed = int.from_bytes(seed_material[:4], "big")
     np.random.seed(seed)
     return (np.random.randint(0,2,n)*2 - 1).astype(np.float32)
 
-# ================= EXTRACT =================
-def extract_bits(segment, nonce):
-    pn = pn_sequence(len(segment), nonce)
-    spb = len(segment) // BIT_LEN
+# ================= EXTRACTION =================
+def extract_segment(segment):
+    spb = len(segment) // TOTAL_BITS
 
-    if spb < 200:
+    # Extract nonce
+    pn1 = fixed_pn(len(segment))
+    nonce_bits = ""
+    for i in range(BIT_LEN_NONCE):
+        seg = segment[i*spb:(i+1)*spb]
+        corr = np.sum(seg * pn1[i*spb:(i+1)*spb])
+        nonce_bits += "1" if corr > 0 else "0"
+
+    nonce = int(nonce_bits,2).to_bytes(8,'big')
+
+    # Extract ciphertext
+    pn2 = derived_pn(len(segment), nonce)
+    cipher_bits = ""
+    for i in range(BIT_LEN_DATA):
+        idx = i + BIT_LEN_NONCE
+        seg = segment[idx*spb:(idx+1)*spb]
+        corr = np.sum(seg * pn2[idx*spb:(idx+1)*spb])
+        cipher_bits += "1" if corr > 0 else "0"
+
+    ciphertext = int(cipher_bits,2).to_bytes(8,'big')
+
+    ctr = Counter.new(64, prefix=nonce)
+    cipher = AES.new(SECRET_KEY, AES.MODE_CTR, counter=ctr)
+
+    try:
+        uid = cipher.decrypt(ciphertext).decode()
+        return str(int(uid))
+    except:
         return None
 
-    bits = ""
-    for i in range(BIT_LEN):
-        seg = segment[i*spb:(i+1)*spb]
-        corr = np.sum(seg * pn[i*spb:(i+1)*spb])
-        bits += "1" if corr > 0 else "0"
-
-    return bits
-
-# ================= DETECT =================
 def detect_watermark(video_bytes):
     with tempfile.TemporaryDirectory() as tmp:
         vpath = f"{tmp}/vid.mp4"
@@ -55,32 +80,15 @@ def detect_watermark(video_bytes):
             sr = w.getframerate()
 
     for start,dur in WM_SEGMENTS:
-        s = int(start * sr)
-        e = int((start+dur) * sr)
+        s = int(start*sr)
+        e = int((start+dur)*sr)
         if e <= len(audio):
-            segment = audio[s:e]
-
-            # brute try extraction
-            for guess in range(3):
-                nonce_guess = segment[:8].astype(np.int8).tobytes()[:8]
-                bits = extract_bits(segment, nonce_guess)
-                if bits:
-                    data = int(bits, 2).to_bytes(len(bits)//8, 'big')
-                    nonce = data[:8]
-                    ciphertext = data[8:]
-
-                    ctr = Counter.new(64, prefix=nonce)
-                    cipher = AES.new(SECRET_KEY, AES.MODE_CTR, counter=ctr)
-
-                    try:
-                        uid = cipher.decrypt(ciphertext).decode()
-                        return str(int(uid))
-                    except:
-                        continue
+            uid = extract_segment(audio[s:e])
+            if uid:
+                return uid
 
     return None
 
-# ================= USER LOOKUP =================
 def get_user(uid):
     conn = sqlite3.connect(DB_NAME)
     user = conn.execute(
@@ -95,7 +103,7 @@ def main():
     st.set_page_config("Guardian App-2","🔍",layout="wide")
     st.title("🔍 Guardian – Watermark Detection")
 
-    f = st.file_uploader("Upload suspected video", type=["mp4","mkv","mov"])
+    f = st.file_uploader("Upload Suspected Video", type=["mp4","mov","mkv"])
 
     if f and st.button("Analyse"):
         with st.spinner("Detecting watermark..."):
@@ -112,7 +120,7 @@ def main():
                 st.write(f"Email: {user[2]}")
                 st.write(f"Phone: {user[3]}")
             else:
-                st.warning("Watermark found but user not in database.")
+                st.warning("Watermark detected but user not in database.")
 
 if __name__ == "__main__":
     main()

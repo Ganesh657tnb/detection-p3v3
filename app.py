@@ -7,14 +7,14 @@ from Cryptodome.Util import Counter
 # ================= CONFIG =================
 SECRET_KEY = b"SixteenByteKey!!"   # SAME AS APP-1
 WM_SEGMENTS = [(10,3), (40,3), (70,3)]
-BIT_LEN = 64   # 8 chars × 8 bits
+BIT_LEN = 64   # 8 chars UID × 8 bits
 
 # ================= DSSS =================
 def pn_sequence(n):
     np.random.seed(42)
     return (np.random.randint(0,2,n)*2 - 1).astype(np.float32)
 
-def recover_bits(audio):
+def extract_bits(audio):
     pn = pn_sequence(len(audio))
     spb = len(audio) // BIT_LEN
     if spb < 200:
@@ -31,19 +31,19 @@ def recover_bits(audio):
 def decrypt_bits(bit_string):
     try:
         data = int(bit_string, 2).to_bytes(len(bit_string)//8, 'big')
-        ctr = Counter.new(128)   # MUST match App-1
+        ctr = Counter.new(128)  # MUST MATCH APP-1
         cipher = AES.new(SECRET_KEY, AES.MODE_CTR, counter=ctr)
         return cipher.decrypt(data).decode().lstrip("0")
     except:
         return None
 
-# ================= DETECTION CORE =================
+# ================= DETECTOR =================
 def detect_watermark(video_bytes):
     with tempfile.TemporaryDirectory() as tmp:
         vpath = f"{tmp}/leak.mp4"
         wavpath = f"{tmp}/audio.wav"
 
-        with open(vpath, "wb") as f:
+        with open(vpath,"wb") as f:
             f.write(video_bytes)
 
         subprocess.run([
@@ -52,31 +52,31 @@ def detect_watermark(video_bytes):
             wavpath
         ], check=True)
 
-        with wave.open(wavpath, 'rb') as w:
+        with wave.open(wavpath,'rb') as w:
             audio = np.frombuffer(
                 w.readframes(w.getnframes()),
                 dtype=np.int16
             ).astype(np.float32)
             sr = w.getframerate()
 
-    recovered_blocks = []
+    recovered = []
 
-    # Scan only watermark windows
+    # 🔑 Decode ONLY watermark windows
     for start,dur in WM_SEGMENTS:
         s = int(start * sr)
         e = int((start+dur) * sr)
         if e <= len(audio):
-            bits = recover_bits(audio[s:e])
+            bits = extract_bits(audio[s:e])
             if bits:
-                recovered_blocks.append(bits)
+                recovered.append(bits)
 
-    if not recovered_blocks:
+    if not recovered:
         return None
 
     # Majority voting
     final_bits = ""
     for i in range(BIT_LEN):
-        votes = [blk[i] for blk in recovered_blocks]
+        votes = [blk[i] for blk in recovered]
         final_bits += max(set(votes), key=votes.count)
 
     return decrypt_bits(final_bits)
@@ -84,30 +84,28 @@ def detect_watermark(video_bytes):
 # ================= STREAMLIT UI =================
 def main():
     st.set_page_config("Guardian App-2","🔍",layout="wide")
-    st.title("🔍 Guardian – Watermark Detection Portal")
+    st.title("🔍 Guardian – Piracy Detection Portal")
 
     st.markdown("""
     Upload a **suspected leaked video**.  
-    This system will extract the hidden watermark and identify  
-    **which user originally downloaded the content**.
+    The system will recover the **hidden downloader ID** from audio watermark.
     """)
 
-    leaked = st.file_uploader(
+    file = st.file_uploader(
         "Upload Suspected Video",
         type=["mp4","mkv","mov"]
     )
 
-    if leaked and st.button("Analyse Watermark"):
-        with st.spinner("Analysing audio watermark…"):
-            uid = detect_watermark(leaked.read())
+    if file and st.button("Analyse Watermark"):
+        with st.spinner("Extracting hidden watermark…"):
+            uid = detect_watermark(file.read())
 
         if not uid:
-            st.success("✅ No valid watermark detected")
+            st.success("✅ No watermark detected")
         else:
             st.error("🚨 PIRACY CONFIRMED")
             st.markdown(f"""
-            ### 🔴 Identified Downloader
-            **Recovered User ID:**  
+            ### 🔴 Recovered Downloader ID
             ```
             {uid}
             ```

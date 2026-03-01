@@ -1,14 +1,13 @@
 import streamlit as st
-import os, sqlite3, tempfile, subprocess, wave
+import tempfile, subprocess, wave
 import numpy as np
 from Cryptodome.Cipher import AES
 from Cryptodome.Util import Counter
 
 # ================= CONFIG =================
-DB_NAME = "guardian_app1.db"      # SAME DB
-SECRET_KEY = b"SixteenByteKey!!"  # SAME KEY
+SECRET_KEY = b"SixteenByteKey!!"   # SAME AS APP-1
 WM_SEGMENTS = [(10,3), (40,3), (70,3)]
-BIT_LEN = 64                     # 8 chars × 8 bits
+BIT_LEN = 64   # 8 chars × 8 bits
 
 # ================= DSSS =================
 def pn_sequence(n):
@@ -32,17 +31,17 @@ def recover_bits(audio):
 def decrypt_bits(bit_string):
     try:
         data = int(bit_string, 2).to_bytes(len(bit_string)//8, 'big')
-        ctr = Counter.new(128)   # ✅ MUST MATCH APP-1
+        ctr = Counter.new(128)   # MUST match App-1
         cipher = AES.new(SECRET_KEY, AES.MODE_CTR, counter=ctr)
         return cipher.decrypt(data).decode().lstrip("0")
     except:
         return None
 
-# ================= WATERMARK DETECTOR =================
+# ================= DETECTION CORE =================
 def detect_watermark(video_bytes):
     with tempfile.TemporaryDirectory() as tmp:
-        vpath = os.path.join(tmp, "leak.mp4")
-        wavpath = os.path.join(tmp, "audio.wav")
+        vpath = f"{tmp}/leak.mp4"
+        wavpath = f"{tmp}/audio.wav"
 
         with open(vpath, "wb") as f:
             f.write(video_bytes)
@@ -60,42 +59,38 @@ def detect_watermark(video_bytes):
             ).astype(np.float32)
             sr = w.getframerate()
 
-    recovered = []
+    recovered_blocks = []
 
-    # 🔁 scan ONLY watermark windows
+    # Scan only watermark windows
     for start,dur in WM_SEGMENTS:
         s = int(start * sr)
         e = int((start+dur) * sr)
         if e <= len(audio):
             bits = recover_bits(audio[s:e])
             if bits:
-                recovered.append(bits)
+                recovered_blocks.append(bits)
 
-    if not recovered:
+    if not recovered_blocks:
         return None
 
-    # 🗳️ majority voting
+    # Majority voting
     final_bits = ""
     for i in range(BIT_LEN):
-        votes = [r[i] for r in recovered]
+        votes = [blk[i] for blk in recovered_blocks]
         final_bits += max(set(votes), key=votes.count)
 
     return decrypt_bits(final_bits)
 
-# ================= DATABASE LOOKUP =================
-def lookup_user(uid):
-    conn = sqlite3.connect(DB_NAME)
-    row = conn.execute(
-        "SELECT username, email, phone FROM users WHERE id=?",
-        (uid,)
-    ).fetchone()
-    conn.close()
-    return row
-
 # ================= STREAMLIT UI =================
 def main():
     st.set_page_config("Guardian App-2","🔍",layout="wide")
-    st.title("🔍 Guardian – Piracy Detection Portal")
+    st.title("🔍 Guardian – Watermark Detection Portal")
+
+    st.markdown("""
+    Upload a **suspected leaked video**.  
+    This system will extract the hidden watermark and identify  
+    **which user originally downloaded the content**.
+    """)
 
     leaked = st.file_uploader(
         "Upload Suspected Video",
@@ -103,27 +98,20 @@ def main():
     )
 
     if leaked and st.button("Analyse Watermark"):
-        with st.spinner("Extracting hidden watermark…"):
+        with st.spinner("Analysing audio watermark…"):
             uid = detect_watermark(leaked.read())
 
         if not uid:
             st.success("✅ No valid watermark detected")
-            return
-
-        user = lookup_user(uid)
-        if not user:
-            st.warning("⚠️ Watermark found, user not in DB")
-            return
-
-        u,e,p = user
-        st.error("🚨 PIRACY CONFIRMED")
-        st.markdown(f"""
-        **Leaked By**
-        - User ID: `{uid}`
-        - Username: `{u}`
-        - Email: `{e}`
-        - Phone: `{p}`
-        """)
+        else:
+            st.error("🚨 PIRACY CONFIRMED")
+            st.markdown(f"""
+            ### 🔴 Identified Downloader
+            **Recovered User ID:**  
+            ```
+            {uid}
+            ```
+            """)
 
 if __name__ == "__main__":
     main()

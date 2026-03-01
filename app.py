@@ -1,19 +1,21 @@
 import streamlit as st
-import sqlite3, tempfile, subprocess, wave, hashlib
+import tempfile, subprocess, wave, hashlib
 import numpy as np
 from Cryptodome.Cipher import AES
 from Cryptodome.Util import Counter
 
-DB_NAME = "guardian.db"
+# ================= CONFIG (MUST MATCH APP-1) =================
 SECRET_KEY = b"SixteenByteKey!!"
 
+GAIN = 0.03
 WM_SEGMENTS = [(10,3), (40,3), (70,3)]
+
 BIT_LEN_NONCE = 64
 BIT_LEN_DATA = 64
 TOTAL_BITS = BIT_LEN_NONCE + BIT_LEN_DATA
 FIXED_SEED = 9999
 
-# ================= PN =================
+# ================= PN SEQUENCES =================
 def fixed_pn(n):
     np.random.seed(FIXED_SEED)
     return (np.random.randint(0,2,n)*2 - 1).astype(np.float32)
@@ -24,44 +26,34 @@ def derived_pn(n, nonce):
     np.random.seed(seed)
     return (np.random.randint(0,2,n)*2 - 1).astype(np.float32)
 
-# ================= EXTRACTION =================
-def extract_segment(segment):
-    spb = len(segment) // TOTAL_BITS
+# ================= BIT EXTRACTION =================
+def extract_bits(audio, pn):
+    spb = len(audio) // TOTAL_BITS
+    if spb < 200:
+        return None
 
-    # Extract nonce
-    pn1 = fixed_pn(len(segment))
-    nonce_bits = ""
-    for i in range(BIT_LEN_NONCE):
-        seg = segment[i*spb:(i+1)*spb]
-        corr = np.sum(seg * pn1[i*spb:(i+1)*spb])
-        nonce_bits += "1" if corr > 0 else "0"
+    bits = ""
+    for i in range(TOTAL_BITS):
+        seg = audio[i*spb:(i+1)*spb]
+        corr = np.sum(seg * pn[i*spb:(i+1)*spb])
+        bits += "1" if corr > 0 else "0"
+    return bits
 
-    nonce = int(nonce_bits,2).to_bytes(8,'big')
-
-    # Extract ciphertext
-    pn2 = derived_pn(len(segment), nonce)
-    cipher_bits = ""
-    for i in range(BIT_LEN_DATA):
-        idx = i + BIT_LEN_NONCE
-        seg = segment[idx*spb:(idx+1)*spb]
-        corr = np.sum(seg * pn2[idx*spb:(idx+1)*spb])
-        cipher_bits += "1" if corr > 0 else "0"
-
-    ciphertext = int(cipher_bits,2).to_bytes(8,'big')
-
-    ctr = Counter.new(64, prefix=nonce)
-    cipher = AES.new(SECRET_KEY, AES.MODE_CTR, counter=ctr)
-
+# ================= AES DECRYPT =================
+def decrypt_uid(nonce, ciphertext):
     try:
+        ctr = Counter.new(64, prefix=nonce)
+        cipher = AES.new(SECRET_KEY, AES.MODE_CTR, counter=ctr)
         uid = cipher.decrypt(ciphertext).decode()
-        return str(int(uid))
+        return uid
     except:
         return None
 
+# ================= DETECTION CORE =================
 def detect_watermark(video_bytes):
     with tempfile.TemporaryDirectory() as tmp:
-        vpath = f"{tmp}/vid.mp4"
-        wav = f"{tmp}/audio.wav"
+        vpath = f"{tmp}/leak.mp4"
+        wavpath = f"{tmp}/audio.wav"
 
         with open(vpath,"wb") as f:
             f.write(video_bytes)
@@ -69,58 +61,79 @@ def detect_watermark(video_bytes):
         subprocess.run([
             "ffmpeg","-y","-i",vpath,
             "-vn","-ac","1","-ar","44100",
-            wav
+            wavpath
         ], check=True, capture_output=True)
 
-        with wave.open(wav,'rb') as w:
+        with wave.open(wavpath,'rb') as w:
             audio = np.frombuffer(
                 w.readframes(w.getnframes()),
                 dtype=np.int16
             ).astype(np.float32)
             sr = w.getframerate()
 
+    recovered = []
+
     for start,dur in WM_SEGMENTS:
         s = int(start*sr)
         e = int((start+dur)*sr)
         if e <= len(audio):
-            uid = extract_segment(audio[s:e])
-            if uid:
-                return uid
+            seg = audio[s:e]
 
-    return None
+            pn_fixed = fixed_pn(len(seg))
+            bits = extract_bits(seg, pn_fixed)
+            if bits:
+                recovered.append(bits)
 
-def get_user(uid):
-    conn = sqlite3.connect(DB_NAME)
-    user = conn.execute(
-        "SELECT id,username,email,phone FROM users WHERE id=?",
-        (int(uid),)
-    ).fetchone()
-    conn.close()
-    return user
+    if not recovered:
+        return None
 
-# ================= STREAMLIT =================
+    # Majority vote
+    final_bits = ""
+    for i in range(TOTAL_BITS):
+        votes = [blk[i] for blk in recovered]
+        final_bits += max(set(votes), key=votes.count)
+
+    nonce_bits = final_bits[:BIT_LEN_NONCE]
+    data_bits = final_bits[BIT_LEN_NONCE:]
+
+    nonce = int(nonce_bits, 2).to_bytes(8, 'big')
+    ciphertext = int(data_bits, 2).to_bytes(8, 'big')
+
+    return decrypt_uid(nonce, ciphertext)
+
+# ================= STREAMLIT UI =================
 def main():
     st.set_page_config("Guardian App-2","🔍",layout="wide")
-    st.title("🔍 Guardian – Watermark Detection")
+    st.title("🔍 Guardian – Watermark Detection Portal")
 
-    f = st.file_uploader("Upload Suspected Video", type=["mp4","mov","mkv"])
+    st.markdown("""
+    Upload a **suspected leaked video**.  
+    This system will:
+    - Extract embedded audio watermark  
+    - Recover encrypted User ID  
+    - Identify the original downloader  
+    """)
 
-    if f and st.button("Analyse"):
+    leaked = st.file_uploader(
+        "Upload Suspected Video",
+        type=["mp4","mkv","mov"]
+    )
+
+    if leaked and st.button("Analyse Watermark"):
         with st.spinner("Detecting watermark..."):
-            uid = detect_watermark(f.read())
+            uid = detect_watermark(leaked.read())
 
         if uid is None:
-            st.success("✅ No watermark detected")
+            st.success("✅ No valid watermark detected")
         else:
-            user = get_user(uid)
-            if user:
-                st.error("🚨 WATERMARK FOUND")
-                st.write(f"User ID: {user[0]}")
-                st.write(f"Username: {user[1]}")
-                st.write(f"Email: {user[2]}")
-                st.write(f"Phone: {user[3]}")
-            else:
-                st.warning("Watermark detected but user not in database.")
+            st.error("🚨 WATERMARK FOUND")
+            st.markdown(f"""
+            ### 🔴 Leak Source Identified
+            **Embedded User ID**
+            ```
+            {uid}
+            ```
+            """)
 
 if __name__ == "__main__":
     main()

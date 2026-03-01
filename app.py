@@ -1,21 +1,24 @@
 import streamlit as st
-import tempfile, subprocess, wave
+import sqlite3, tempfile, subprocess, wave, hashlib
 import numpy as np
 from Cryptodome.Cipher import AES
 from Cryptodome.Util import Counter
 
-# ================= CONFIG =================
-SECRET_KEY = b"SixteenByteKey!!"   # MUST match App-1
+DB_NAME = "guardian.db"
+SECRET_KEY = b"SixteenByteKey!!"
 WM_SEGMENTS = [(10,3), (40,3), (70,3)]
-BIT_LEN = 64  # 8 bytes UID
+BIT_LEN = 128
 
-# ================= DSSS =================
-def pn_sequence(n):
-    np.random.seed(42)
+# ================= PN =================
+def pn_sequence(n, nonce):
+    seed_material = hashlib.sha256(SECRET_KEY + nonce).digest()
+    seed = int.from_bytes(seed_material[:4], "big")
+    np.random.seed(seed)
     return (np.random.randint(0,2,n)*2 - 1).astype(np.float32)
 
-def extract_bits(segment):
-    pn = pn_sequence(len(segment))
+# ================= EXTRACT =================
+def extract_bits(segment, nonce):
+    pn = pn_sequence(len(segment), nonce)
     spb = len(segment) // BIT_LEN
 
     if spb < 200:
@@ -29,17 +32,7 @@ def extract_bits(segment):
 
     return bits
 
-# ================= CRYPTO =================
-def decrypt_bits(bits):
-    try:
-        data = int(bits, 2).to_bytes(len(bits)//8, 'big')
-        ctr = Counter.new(128)
-        cipher = AES.new(SECRET_KEY, AES.MODE_CTR, counter=ctr)
-        return cipher.decrypt(data).decode()
-    except:
-        return None
-
-# ================= DETECTION =================
+# ================= DETECT =================
 def detect_watermark(video_bytes):
     with tempfile.TemporaryDirectory() as tmp:
         vpath = f"{tmp}/vid.mp4"
@@ -61,26 +54,41 @@ def detect_watermark(video_bytes):
             ).astype(np.float32)
             sr = w.getframerate()
 
-    recovered = []
-
     for start,dur in WM_SEGMENTS:
         s = int(start * sr)
         e = int((start+dur) * sr)
         if e <= len(audio):
-            bits = extract_bits(audio[s:e])
-            if bits:
-                recovered.append(bits)
+            segment = audio[s:e]
 
-    if not recovered:
-        return None
+            # brute try extraction
+            for guess in range(3):
+                nonce_guess = segment[:8].astype(np.int8).tobytes()[:8]
+                bits = extract_bits(segment, nonce_guess)
+                if bits:
+                    data = int(bits, 2).to_bytes(len(bits)//8, 'big')
+                    nonce = data[:8]
+                    ciphertext = data[8:]
 
-    # majority vote
-    final_bits = ""
-    for i in range(BIT_LEN):
-        votes = [blk[i] for blk in recovered]
-        final_bits += max(set(votes), key=votes.count)
+                    ctr = Counter.new(64, prefix=nonce)
+                    cipher = AES.new(SECRET_KEY, AES.MODE_CTR, counter=ctr)
 
-    return decrypt_bits(final_bits)
+                    try:
+                        uid = cipher.decrypt(ciphertext).decode()
+                        return str(int(uid))
+                    except:
+                        continue
+
+    return None
+
+# ================= USER LOOKUP =================
+def get_user(uid):
+    conn = sqlite3.connect(DB_NAME)
+    user = conn.execute(
+        "SELECT id,username,email,phone FROM users WHERE id=?",
+        (int(uid),)
+    ).fetchone()
+    conn.close()
+    return user
 
 # ================= STREAMLIT =================
 def main():
@@ -96,8 +104,15 @@ def main():
         if uid is None:
             st.success("✅ No watermark detected")
         else:
-            st.error("🚨 WATERMARK FOUND")
-            st.code(uid)
+            user = get_user(uid)
+            if user:
+                st.error("🚨 WATERMARK FOUND")
+                st.write(f"User ID: {user[0]}")
+                st.write(f"Username: {user[1]}")
+                st.write(f"Email: {user[2]}")
+                st.write(f"Phone: {user[3]}")
+            else:
+                st.warning("Watermark found but user not in database.")
 
 if __name__ == "__main__":
     main()
